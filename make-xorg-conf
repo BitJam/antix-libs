@@ -12,12 +12,14 @@ FALLBACK_RESOLUTION="1280x1024"
 
 ME=${0##*/}
 
-XORG_CONF=./xorg.conf
 DO_XORG=
 
 VBOX_OPTS="HORIZ=28-70  DRIVER=vesa RESOLUTION=1280x1024"
 DRIVER_DIR=/usr/lib/xorg/modules/drivers
 DRIVER_EXT=_drv.so
+
+DEFAULT_DEPTH=
+DEFAULT_DRIVER="vesa"
 
 VALID_DRIVERS=$(ls $DRIVER_DIR | sed -n "s/$DRIVER_EXT//p")
 
@@ -45,6 +47,8 @@ the order.
 
     $ME fbdev,vesa
 
+NOTE: "$DEFAULT_DRIVER" and "default" and "safe" all do the same thing now.
+
 Options:
     -f --force          Force creation even if driver specfied is not found
     -h --help           Show this usage
@@ -52,12 +56,15 @@ Options:
     --                  Optional delimiter to indicate the end of options
 
 Xorg Arguments:
-A comma delimited list of options.
+A comma delimited list of options.  Note that "composite" can be
+abbreviated as "c" and "depth" can be abbrevaiated as "d".
 
-    safe              Set driver to "vesa" and set default resolutions
+    safe              Set driver to "$DEFAUL_DRIVER"
     auto              Set default resolutions
-    default           Set vesa driver and default resolutions
+    c, composite      Tell xorg to use compositor (for graphics effects)
+    default           Set driver to "$DEFAULT_DRIVER"
     HHHHxWWWW         Set the resolution
+    d=xx, depth=xx    Set the default color depth
     h=xxxx            Set horizontal sync frequency range
     v=yyyy            Set vertical refresh frequency range
     vbox              Set the driver and horizontal frequency:
@@ -77,6 +84,7 @@ Usage
 main() {
 
     # Read command line params that start with "-" and remove them from "$@"
+    ORIG_ARGS="$*"
     local SHIFT
     read_params "$@"
     shift $SHIFT
@@ -129,22 +137,26 @@ read_cmdline() {
     # Lowest priority gets evaluted first.
     # Yes, these both do the same thing (for now).
     case ,$1, in
-         *,default,*)  DRIVER=vesa  ; RESOLUTION=default ;;
+         *,default,*) DRIVER=$DEFAULT_DRIVER ;;
     esac
 
     case ,$1, in
-            *,safe,*)  DRIVER=vesa  ; RESOLUTION=safe    ;;
+            *,safe,*) DRIVER=$DEFAULT_DRIVER ;;
     esac
 
     for param in ${1//,/ };  do
         value=${param#*=}
 
         case $param in
-            safe|default)                     ;;
-                    vbox) eval "$VBOX_OPTS"   ;;
-                     h=*)      HORIZ=$value   ;;
-                     v=*)       VERT=$value   ;;
-                    auto) RESOLUTION=default  ;;
+
+                   res=*) RESOLUTION=$value    ;;
+             composite|c) ADD_COMPOSITE=true   ;;
+             depth=*|d=*) DEFAULT_DEPTH=$value ;;
+            safe|default)                      ;;
+                    vbox) eval "$VBOX_OPTS"    ;;
+                     h=*)      HORIZ=$value    ;;
+                     v=*)       VERT=$value    ;;
+                    auto) RESOLUTION=default   ;;
 
                  uxa|sna) ADD_INTEL_ACCEL=$value
                           DRIVER=intel ;;
@@ -159,7 +171,7 @@ read_cmdline() {
 }
 
 #-------------------------------------------------------------------------------
-# Create a mode (resolution) section based on the parameter based.  If there
+# Create a mode (resolution) section based on the parameter.  If there
 # is no parameter then we don't create this section.  A "safe" parameter
 # creates a resolution of $SAFE_RESOLUTION.  A "default" parameter will try to
 # use the resolution of the framebuffer if it is bigger than 1024x768.  If the
@@ -172,7 +184,8 @@ modes_section() {
     local res_regex="[0-9]\+x[0-9]\+"
 
     case $param in
-           safe) param=$SAFE_RESOLUTION       ;;
+           safe) param=$(good_fb_res $param)  ;;
+          #safe) param=$SAFE_RESOLUTION       ;;
         default) param=$(good_fb_res $param)  ;;
     esac
 
@@ -211,7 +224,21 @@ Modes_Section
 driver_entry() {
     local driver=$1
     [ "$driver" ] || return
-    printf "\n    Driver     \"$driver\""
+
+    local newline="\n"
+    if [ "$DRIVER_ERROR" ]; then
+        driver=$DEFAULT_DRIVER
+        newline=""
+        echo ; echo
+        cat<<Driver_Error
+    #=========================================================================
+    # WARNING: the "$DRIVER_ERROR" driver was not found.  Using "$driver" instead.
+    # Use the --force option to force the use of any driver.
+    #=========================================================================
+Driver_Error
+    fi
+
+    printf "$newline    Driver     \"$driver\""
 }
 
 horizontal_entry() {
@@ -237,6 +264,8 @@ write_xorg_conf() {
 #
 # If you want to save customizations, delete the line above or this
 # file will get automatically deleted on the next live boot.
+#
+# Command line parameters: $ORIG_ARGS
 #-----------------------------------------------------------------------------
 
 Section "Monitor"
@@ -246,20 +275,38 @@ EndSection
 
 Section "Device"
     Identifier "Device0"$(driver_entry $driver)$(add_intel_accel)
-EndSection
+EndSection$(composite_section $ADD_COMPOSITE)
 
 Section "Screen"
     Identifier      "Screen0"
     Monitor         "Monitor0"
-    Device          "Device0"
-    DefaultDepth    16$(modes_section $mode)
+    Device          "Device0"$(add_default_depth $DEFAULT_DEPTH)$(modes_section $mode)
 EndSection
 Xorg_Conf
 }
 
-add_intel_accel() {
-    [ "$ADD_INTEL_ACCEL" ] && echo -e "\n    Option     \"AccelMethod\"  \"$ADD_INTEL_ACCEL\""
+add_default_depth() {
+    local depth=$1
+    [ -n "$depth" ] || return
+    echo -e "\n    DefaultDepth    $depth"
 }
+
+composite_section() {
+    local flag=$1
+    [ -n "$flag" ] || return
+    echo ; echo
+    cat<<Composite_Section
+Section "Extensions"
+   Option "Composite" "Enable"
+EndSection
+Composite_Section
+}
+
+add_intel_accel() {
+    [ "$ADD_INTEL_ACCEL" ] || return
+    echo -e "\n    Option     \"AccelMethod\"  \"$ADD_INTEL_ACCEL\""
+}
+
 good_fb_res() {
     local param=${1:-unknown} fb_size fb_name x
     local sys_dir=/sys/class/graphics/fb0
@@ -295,16 +342,11 @@ good_fb_res() {
 
 driver_error() {
     local driver=$1
+    DRIVER_ERROR=$driver
     cat <<Driver_Error >&2
-$WHITE$ME$YELLOW Error:$RED Unrecognized (uninstalled?) video driver:$WHITE $driver
-$RED
-Available drivers:
-$(echo "$VALID_DRIVERS" | column -c 70)
-
-Use --force to force use of an unrecognized driver$NC
+    $WHITE$ME$YELLOW Warning:$RED Unrecognized (uninstalled?) video driver:$WHITE $driver$NC
+    ${WHITE}Using $DEFAULT_DRIVER instead$NC
 Driver_Error
-
-    exit 3
 }
 
 error() {
